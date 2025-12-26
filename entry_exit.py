@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
+from risk import RiskConfig, size_position
 
 # IMPORTANT:
 # If your stop_loss module imports Bar and PositionDirection from this file,
@@ -53,8 +55,46 @@ class SwingLevels:
       - last_swing_high_price == lastSwingHighPrice
       - last_swing_low_price == lastSwingLowPrice
     """
-    last_swing_high_price: Optional[float]
-    last_swing_low_price: Optional[float]
+    last_swing_high_price: Optional[float] = None
+    last_swing_low_price: Optional[float] = None
+
+
+def has_level(level: Optional[float]) -> bool:
+    """Level is usable only if it is not None/NaN."""
+    return level is not None and not (isinstance(level, float) and math.isnan(level))
+
+
+def bos_up(close: float, last_high: Optional[float]) -> bool:
+    """Break of structure to the upside."""
+    return has_level(last_high) and close > last_high  # type: ignore[arg-type]
+
+
+def bos_down(close: float, last_low: Optional[float]) -> bool:
+    """Break of structure to the downside."""
+    return has_level(last_low) and close < last_low  # type: ignore[arg-type]
+
+
+def update_last_swing_levels(
+    swing_levels: SwingLevels,
+    *,
+    highlow_flag: Optional[float],
+    level: Optional[float],
+) -> SwingLevels:
+    """
+    Update last swing levels only when a confirmed swing is observed.
+
+    Args:
+        highlow_flag: 1 for swing high, -1 for swing low, anything else leaves levels unchanged.
+        level: swing price level; ignored if invalid.
+    """
+    if not has_level(level):
+        return swing_levels
+
+    if highlow_flag == 1:
+        return SwingLevels(last_swing_high_price=level, last_swing_low_price=swing_levels.last_swing_low_price)
+    if highlow_flag == -1:
+        return SwingLevels(last_swing_high_price=swing_levels.last_swing_high_price, last_swing_low_price=level)
+    return swing_levels
 
 
 @dataclass(frozen=True)
@@ -78,7 +118,7 @@ class TradePlan:
     Contains:
       - signal_candle_index: t (where BOS was detected on close)
       - entry_candle_index: t+1 (where we execute on open)
-      - entry_price, sl_price, tp_price
+      - entry_price, sl_price, tp_price, quantity
     """
     direction: PositionDirection
     signal_candle_index: int
@@ -86,6 +126,7 @@ class TradePlan:
     entry_price: float
     sl_price: float
     tp_price: float
+    quantity: float
 
 
 @dataclass(frozen=True)
@@ -116,10 +157,15 @@ def detect_bos_signal(*, bars: list[Bar], t: int, swing_levels: SwingLevels) -> 
 
     close_t = bars[t].close
 
-    if swing_levels.last_swing_high_price is not None and close_t > swing_levels.last_swing_high_price:
+    if not has_level(swing_levels.last_swing_high_price):
+        assert not bos_up(close_t, swing_levels.last_swing_high_price)
+    if not has_level(swing_levels.last_swing_low_price):
+        assert not bos_down(close_t, swing_levels.last_swing_low_price)
+
+    if bos_up(close_t, swing_levels.last_swing_high_price):
         return BosSignal(direction=PositionDirection.LONG, signal_candle_index=t)
 
-    if swing_levels.last_swing_low_price is not None and close_t < swing_levels.last_swing_low_price:
+    if bos_down(close_t, swing_levels.last_swing_low_price):
         return BosSignal(direction=PositionDirection.SHORT, signal_candle_index=t)
 
     return None
@@ -161,8 +207,9 @@ def calculate_take_profit_price(
     if tp_mode == TakeProfitMode.RANGE_BASED:
         hi = swing_levels.last_swing_high_price
         lo = swing_levels.last_swing_low_price
-        if hi is None or lo is None:
+        if not (has_level(hi) and has_level(lo)):
             raise ValueError("RANGE_BASED: requires both last swing high and last swing low.")
+        assert hi is not None and lo is not None
         rng = hi - lo
         if rng <= 0:
             raise ValueError("RANGE_BASED: invalid range (swing high must be > swing low).")
@@ -182,6 +229,9 @@ def plan_trade_from_signal(
     stop_loss_manager,
     tp_mode: TakeProfitMode,
     tp_mult: float,
+    risk_config: RiskConfig,
+    buying_power_cash: Optional[float] = None,
+    position_sizer=size_position,
 ) -> TradePlan:
     """
     WHERE ENTRY HAPPENS (V1):
@@ -193,8 +243,9 @@ def plan_trade_from_signal(
     This function:
       1) Takes entry_price from Open[t+1]
       2) Fixes SL using your StopLossManager.on_entry(...)
-      3) Calculates TP (RR-based or Range-based)
-      4) Returns a TradePlan with entry/sl/tp fixed
+      3) Calculates position size (risk-based)
+      4) Calculates TP (RR-based or Range-based)
+      5) Returns a TradePlan with entry/sl/tp/qty fixed
     """
     t = bos_signal.signal_candle_index
     entry_candle_index = t + 1
@@ -212,6 +263,18 @@ def plan_trade_from_signal(
         signal_bar=bars[t],
     )
 
+    qty, refuse_reason = position_sizer(
+        direction=bos_signal.direction,
+        entry_price=entry_price,
+        sl_price=sl_price,
+        risk_config=risk_config,
+        buying_power_cash=buying_power_cash,
+    )
+    if qty is None or qty <= 0:
+        raise ValueError(
+            f"Position sizing refused (reason={refuse_reason}, dir={bos_signal.direction}, entry={entry_price}, sl={sl_price})"
+        )
+
     tp_price = calculate_take_profit_price(
         direction=bos_signal.direction,
         tp_mode=tp_mode,
@@ -228,6 +291,7 @@ def plan_trade_from_signal(
         entry_price=entry_price,
         sl_price=sl_price,
         tp_price=tp_price,
+        quantity=qty,
     )
 
 

@@ -1,18 +1,19 @@
-from entry_exit import Bar, PositionDirection
+import math
+from entry_exit import Bar, PositionDirection, has_level
 from typing import Optional
 
 
 class StopLossManager:
     """
-    Менеджер стоп-лосса.
+    Stop loss manager.
 
-    Рассчитывает стоп-лосс при входе в позицию и проверяет его срабатывание на каждом баре.
-    Поддерживает три режима:
-    - fixed: фиксированный процент от цены входа
-    - structural: за последним swing-уровнем + буфер
-    - bos: за экстремумом сигнальной свечи (Break of Structure) + буфер
+    Computes SL on entry and checks its trigger on every bar.
+    Supports three modes:
+    - fixed: fixed percent from entry
+    - structural: behind last swing level + buffer
+    - bos: beyond the signal candle extreme (Break of Structure) + buffer
 
-    Стоп-лосс фиксируется один раз при входе и дальше не меняется.
+    Stop loss is fixed once at entry and then stays unchanged.
     """
 
     VALID_MODES = {"fixed", "structural", "bos"}
@@ -24,24 +25,24 @@ class StopLossManager:
         buffer_pct: float = 0.001,
     ):
         """
-        Инициализация менеджера стоп-лосса.
+        Initialize stop loss manager.
 
         Args:
-            mode: Режим расчёта SL ("fixed" | "structural" | "bos")
-            fixed_pct: Процент от цены входа для режима fixed (например, 0.01 = 1%)
-            buffer_pct: Буфер в процентах от цены входа для режимов structural и bos
+            mode: SL mode ("fixed" | "structural" | "bos")
+            fixed_pct: Percent of entry for fixed mode (e.g., 0.01 = 1%)
+            buffer_pct: Buffer percent of entry for structural and bos
 
         Raises:
-            ValueError: Если передан некорректный mode или отрицательные/нулевые значения параметров
+            ValueError: If mode is invalid or parameters are non-positive
         """
         if mode not in self.VALID_MODES:
             raise ValueError(
-                f"Неверный mode: '{mode}'. Допустимые: {', '.join(self.VALID_MODES)}"
+                f"Invalid mode: '{mode}'. Allowed: {', '.join(self.VALID_MODES)}"
             )
         if fixed_pct <= 0:
-            raise ValueError(f"fixed_pct должен быть > 0, получено {fixed_pct}")
+            raise ValueError(f"fixed_pct must be > 0, got {fixed_pct}")
         if buffer_pct < 0:
-            raise ValueError(f"buffer_pct не может быть отрицательным, получено {buffer_pct}")
+            raise ValueError(f"buffer_pct cannot be negative, got {buffer_pct}")
 
         self.mode = mode
         self.fixed_pct = fixed_pct
@@ -50,9 +51,9 @@ class StopLossManager:
 
     def reset(self) -> None:
         """
-        Сброс состояния менеджера.
+        Reset manager state.
 
-        Вызывается после закрытия позиции, чтобы подготовить менеджер к новому входу.
+        Call after a position is closed to prepare for the next entry.
         """
         self.direction: Optional[PositionDirection] = None
         self.entry_price: Optional[float] = None
@@ -69,30 +70,31 @@ class StopLossManager:
         signal_bar: Optional[Bar] = None,
     ) -> float:
         """
-        Рассчитывает и фиксирует стоп-лосс при входе в позицию.
+        Compute and fix stop loss on position entry.
 
         Args:
-            direction: Направление позиции (PositionDirection.LONG или .SHORT)
-            entry_price: Цена входа в позицию
-            last_swing_high: Цена последнего swing high (обязательно для mode="structural")
-            last_swing_low: Цена последнего swing low (обязательно для mode="structural")
-            signal_bar: Сигнальная свеча BOS (обязательно для mode="bos")
+            direction: Position direction (PositionDirection.LONG or .SHORT)
+            entry_price: Position entry price
+            last_swing_high: Last swing high price (used in structural for SHORT)
+            last_swing_low: Last swing low price (used in structural for LONG)
+            signal_bar: BOS candle t (closed at t, entry at open t+1).
+                StopLossManager does not compute BOS — caller responsibility.
 
         Returns:
-            float: Рассчитанная цена стоп-лосса
+            float: Calculated stop loss price
 
         Raises:
-            RuntimeError: Если менеджер уже активен (не вызван reset())
-            ValueError: Если для выбранного режима не переданы обязательные параметры
-            ValueError: Если entry_price <= 0
+            RuntimeError: If manager is already active (reset() not called)
+            ValueError: If required parameters for the chosen mode are missing
+            ValueError: If entry_price <= 0
         """
         if self.active:
             raise RuntimeError(
-                "StopLossManager уже активен! Вызови reset() перед новым входом."
+                "StopLossManager already active! Call reset() before a new entry."
             )
 
         if entry_price <= 0:
-            raise ValueError(f"entry_price должен быть > 0, получено {entry_price}")
+            raise ValueError(f"entry_price must be > 0, got {entry_price}")
 
         self.direction = direction
         self.entry_price = entry_price
@@ -101,29 +103,43 @@ class StopLossManager:
             self.stop_price = self._fixed_sl()
 
         elif self.mode == "structural":
-            if last_swing_high is None or last_swing_low is None:
-                raise ValueError(
-                    "Для режима 'structural' обязательно передать last_swing_high и last_swing_low!"
-                )
-            self.stop_price = self._structural_sl(last_swing_high, last_swing_low)
+            if direction == PositionDirection.LONG:
+                if not has_level(last_swing_low):
+                    raise ValueError("For 'structural' LONG you must provide last_swing_low")
+                assert last_swing_low is not None
+                self.stop_price = self._structural_sl_long(last_swing_low)
+            elif direction == PositionDirection.SHORT:
+                if not has_level(last_swing_high):
+                    raise ValueError("For 'structural' SHORT you must provide last_swing_high")
+                assert last_swing_high is not None
+                self.stop_price = self._structural_sl_short(last_swing_high)
 
         elif self.mode == "bos":
             if signal_bar is None:
-                raise ValueError("Для режима 'bos' обязательно передать signal_bar!")
+                raise ValueError("For 'bos' you must provide signal_bar!")
+            # bos: stop is placed beyond the signal candle extreme (t) with no lookahead for future swings.
             self.stop_price = self._bos_sl(signal_bar)
 
+        if self.stop_price is None:
+            raise ValueError(f"stop_price not computed (mode={self.mode}, direction={direction})")
+        self._validate_stop_price(
+            self.stop_price,
+            last_swing_high=last_swing_high,
+            last_swing_low=last_swing_low,
+            signal_bar=signal_bar,
+        )
         self.active = True
         return self.stop_price
 
     def should_exit(self, bar: Bar) -> bool:
         """
-        Проверяет, сработал ли стоп-лосс на текущем баре.
+        Check if stop loss is hit on the current bar.
 
         Args:
-            bar: Текущая свеча (Bar)
+            bar: Current candle (Bar)
 
         Returns:
-            bool: True, если цена бара пробила стоп-лосс, иначе False
+            bool: True if price crosses stop loss, else False
         """
         if not self.active:
             return False
@@ -138,47 +154,39 @@ class StopLossManager:
 
     def _fixed_sl(self) -> float:
         """
-        Рассчитывает стоп-лосс для режима fixed.
+        Compute stop loss for fixed mode.
 
         Returns:
-            float: Цена стоп-лосса
+            float: Stop loss price
         """
         if self.direction == PositionDirection.LONG:
             return self.entry_price * (1 - self.fixed_pct)
 
         return self.entry_price * (1 + self.fixed_pct)
 
-    def _structural_sl(
-        self,
-        last_swing_high: float,
-        last_swing_low: float,
-    ) -> float:
+    def _structural_sl_long(self, last_swing_low: float) -> float:
         """
-        Рассчитывает стоп-лосс для режима structural (за swing-уровнем).
-
-        Args:
-            last_swing_high: Цена последнего swing high
-            last_swing_low: Цена последнего swing low
-
-        Returns:
-            float: Цена стоп-лосса с учётом буфера
+        Compute stop loss for structural LONG (below last swing low).
         """
         buffer = self.entry_price * self.buffer_pct
+        return last_swing_low - buffer
 
-        if self.direction == PositionDirection.LONG:
-            return last_swing_low - buffer
-
+    def _structural_sl_short(self, last_swing_high: float) -> float:
+        """
+        Compute stop loss for structural SHORT (above last swing high).
+        """
+        buffer = self.entry_price * self.buffer_pct
         return last_swing_high + buffer
 
     def _bos_sl(self, signal_bar: Bar) -> float:
         """
-        Рассчитывает стоп-лосс для режима bos (за экстремумом сигнальной свечи).
+        Compute stop loss for bos mode (beyond signal candle extreme).
 
         Args:
-            signal_bar: Сигнальная свеча Break of Structure
+            signal_bar: Break of Structure signal candle
 
         Returns:
-            float: Цена стоп-лосса с учётом буфера
+            float: Stop loss price with buffer
         """
         buffer = self.entry_price * self.buffer_pct
 
@@ -186,3 +194,38 @@ class StopLossManager:
             return signal_bar.low - buffer
 
         return signal_bar.high + buffer
+
+    def _validate_stop_price(
+        self,
+        stop_price: Optional[float],
+        *,
+        last_swing_high: Optional[float],
+        last_swing_low: Optional[float],
+        signal_bar: Optional[Bar],
+    ) -> None:
+        """
+        Unified validation of stop: validity and side relative to entry.
+        """
+        if self.entry_price is None:
+            raise ValueError("entry_price is missing before stop validation")
+
+        if stop_price is None or (isinstance(stop_price, float) and not math.isfinite(stop_price)):
+            raise ValueError(
+                f"Invalid stop_price (mode={self.mode}, dir={self.direction}, entry={self.entry_price}, stop={stop_price}, "
+                f"last_swing_high={last_swing_high}, last_swing_low={last_swing_low})"
+            )
+
+        if stop_price <= 0:
+            raise ValueError(
+                f"stop_price must be > 0 (mode={self.mode}, dir={self.direction}, entry={self.entry_price}, stop={stop_price})"
+            )
+
+        if self.direction == PositionDirection.LONG and stop_price >= self.entry_price:
+            raise ValueError(
+                f"LONG stop must be below entry (mode={self.mode}, entry={self.entry_price}, stop={stop_price}, last_swing_low={last_swing_low})"
+            )
+
+        if self.direction == PositionDirection.SHORT and stop_price <= self.entry_price:
+            raise ValueError(
+                f"SHORT stop must be above entry (mode={self.mode}, entry={self.entry_price}, stop={stop_price}, last_swing_high={last_swing_high})"
+            )
