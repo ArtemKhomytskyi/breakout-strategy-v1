@@ -4,9 +4,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-# ВАЖНО:
-# stop_loss.py импортирует Bar, PositionDirection из entry_exit.
-# Поэтому эти имена должны жить в этом модуле в таком виде.
+# IMPORTANT:
+# If your stop_loss module imports Bar and PositionDirection from this file,
+# these names must exist here and keep the same meaning.
 
 
 class PositionDirection(str, Enum):
@@ -32,31 +32,57 @@ class SameBarSlTpRule(str, Enum):
 
 @dataclass(frozen=True)
 class Bar:
+    """
+    OHLC candlestick bar.
+    Volume/time are optional and not required for V1 entry/exit rules.
+    """
     open: float
     high: float
     low: float
     close: float
     volume: Optional[float] = None
-    time: Optional[str] = None
+    time: Optional[str] = None  # Replace with datetime if you prefer.
 
 
 @dataclass(frozen=True)
 class SwingLevels:
+    """
+    Snapshot of swing levels used by the strategy.
+
+    Names match the V1 document:
+      - last_swing_high_price == lastSwingHighPrice
+      - last_swing_low_price == lastSwingLowPrice
+    """
     last_swing_high_price: Optional[float]
     last_swing_low_price: Optional[float]
 
 
 @dataclass(frozen=True)
 class BosSignal:
+    """
+    BOS signal detected on the CLOSE of the signal candle (t).
+
+    Execution in V1 is deterministic:
+      - signal is confirmed on Close[t]
+      - entry is executed on Open[t+1]
+    """
     direction: PositionDirection
     signal_candle_index: int  # t
 
 
 @dataclass(frozen=True)
 class TradePlan:
+    """
+    Trade plan created at entry time (V1 fixes SL/TP at entry).
+
+    Contains:
+      - signal_candle_index: t (where BOS was detected on close)
+      - entry_candle_index: t+1 (where we execute on open)
+      - entry_price, sl_price, tp_price
+    """
     direction: PositionDirection
-    signal_candle_index: int  # t (где BOS по close)
-    entry_candle_index: int   # t+1 (где вход по open)
+    signal_candle_index: int
+    entry_candle_index: int
     entry_price: float
     sl_price: float
     tp_price: float
@@ -64,21 +90,27 @@ class TradePlan:
 
 @dataclass(frozen=True)
 class TradeExit:
+    """
+    Exit event for a trade: price and reason (SL or TP).
+    """
     exit_price: float
     exit_reason: ExitReason
 
 
 def detect_bos_signal(*, bars: list[Bar], t: int, swing_levels: SwingLevels) -> Optional[BosSignal]:
     """
-    V1 BOS:
-      - BOS Long: Close[t] > lastSwingHighPrice
+    V1 BOS definition:
+
+      - BOS Long:  Close[t] > lastSwingHighPrice
       - BOS Short: Close[t] < lastSwingLowPrice
 
-    Сигнал на close[t], но вход возможен только если существует t+1.
+    Signal is evaluated on the CLOSE of bar t.
+    Entry requires bar t+1 to exist (executed on Open[t+1]).
     """
     if t < 0 or t >= len(bars):
         raise IndexError("Bar index out of range.")
 
+    # We need the next bar for execution on Open[t+1].
     if t + 1 >= len(bars):
         return None
 
@@ -103,14 +135,15 @@ def calculate_take_profit_price(
     swing_levels: SwingLevels,
 ) -> float:
     """
-    TP V1:
-      RR_BASED:
-        R = |Entry - SL|
-        Long:  TP = Entry + k*R
-        Short: TP = Entry - k*R
+    V1 Take Profit modes:
 
-      RANGE_BASED:
-        range = lastSwingHigh - lastSwingLow
+    1) RR_BASED:
+        R = abs(Entry - SL)
+        Long:  TP = Entry + k * R
+        Short: TP = Entry - k * R
+
+    2) RANGE_BASED:
+        range = lastSwingHighPrice - lastSwingLowPrice
         Long:  TP = Entry + range
         Short: TP = Entry - range
     """
@@ -121,7 +154,9 @@ def calculate_take_profit_price(
         if tp_mult <= 0:
             raise ValueError("RR_BASED: tp_mult must be > 0.")
 
-        return entry_price + tp_mult * r if direction == PositionDirection.LONG else entry_price - tp_mult * r
+        if direction == PositionDirection.LONG:
+            return entry_price + tp_mult * r
+        return entry_price - tp_mult * r
 
     if tp_mode == TakeProfitMode.RANGE_BASED:
         hi = swing_levels.last_swing_high_price
@@ -132,7 +167,9 @@ def calculate_take_profit_price(
         if rng <= 0:
             raise ValueError("RANGE_BASED: invalid range (swing high must be > swing low).")
 
-        return entry_price + rng if direction == PositionDirection.LONG else entry_price - rng
+        if direction == PositionDirection.LONG:
+            return entry_price + rng
+        return entry_price - rng
 
     raise ValueError(f"Unsupported tp_mode: {tp_mode}")
 
@@ -142,29 +179,31 @@ def plan_trade_from_signal(
     bars: list[Bar],
     bos_signal: BosSignal,
     swing_levels: SwingLevels,
-    stop_loss_manager,  # StopLossManager из твоего файла
+    stop_loss_manager,
     tp_mode: TakeProfitMode,
     tp_mult: float,
 ) -> TradePlan:
     """
-    ГДЕ ENTRY:
-      Entry (исполнение) = Open[t+1]
+    WHERE ENTRY HAPPENS (V1):
 
-    Тут мы:
-      - берём entry_price по open следующей свечи
-      - фиксируем SL через stop_loss_manager.on_entry(...)
-      - считаем TP
-      - возвращаем TradePlan
+      - Signal candle index = t (BOS confirmed on Close[t])
+      - Entry candle index  = t+1
+      - Entry price         = Open[t+1]
+
+    This function:
+      1) Takes entry_price from Open[t+1]
+      2) Fixes SL using your StopLossManager.on_entry(...)
+      3) Calculates TP (RR-based or Range-based)
+      4) Returns a TradePlan with entry/sl/tp fixed
     """
     t = bos_signal.signal_candle_index
     entry_candle_index = t + 1
     if entry_candle_index >= len(bars):
-        raise ValueError("Cannot plan entry: t+1 bar does not exist.")
+        raise ValueError("Cannot plan entry: next candle (t+1) does not exist.")
 
     entry_price = bars[entry_candle_index].open
 
-    # Берём SL строго через твой StopLossManager :contentReference[oaicite:1]{index=1}
-    # Передаём всё сразу: он сам проверит, что нужно для выбранного режима.
+    # Stop Loss is fixed at entry using your stop-loss module.
     sl_price = stop_loss_manager.on_entry(
         direction=bos_signal.direction,
         entry_price=entry_price,
@@ -201,14 +240,22 @@ def check_exit_rules(
     same_bar_rule: SameBarSlTpRule,
 ) -> Optional[TradeExit]:
     """
-    Exit V1:
-      LONG:  SL if Low <= SL, TP if High >= TP
-      SHORT: SL if High >= SL, TP if Low <= TP
+    V1 exit rules:
 
-    Same bar SL+TP:
-      - WORST_CASE: считаем SL первым
-      - OPEN_PROXIMITY: кто ближе к open, тот первый
-      - LOWER_TIMEFRAME: не реализуем тут
+    LONG:
+      - SL hit if Low <= SL
+      - TP hit if High >= TP
+
+    SHORT:
+      - SL hit if High >= SL
+      - TP hit if Low <= TP
+
+    If both SL and TP are hit within the same bar (OHLC-only ambiguity),
+    we apply a deterministic tie-breaking rule:
+
+      - WORST_CASE: assume SL first
+      - OPEN_PROXIMITY: assume whichever level is closer to bar.open is hit first
+      - LOWER_TIMEFRAME: not implemented in this module
     """
     if direction == PositionDirection.LONG:
         sl_hit = bar.low <= sl_price
@@ -226,7 +273,7 @@ def check_exit_rules(
     if tp_hit and not sl_hit:
         return TradeExit(exit_price=tp_price, exit_reason=ExitReason.TP)
 
-    # both hit
+    # Both hit in the same bar
     if same_bar_rule == SameBarSlTpRule.WORST_CASE:
         return TradeExit(exit_price=sl_price, exit_reason=ExitReason.SL)
 
@@ -238,6 +285,8 @@ def check_exit_rules(
         return TradeExit(exit_price=tp_price, exit_reason=ExitReason.TP)
 
     if same_bar_rule == SameBarSlTpRule.LOWER_TIMEFRAME:
-        raise NotImplementedError("LOWER_TIMEFRAME requires lower TF data in the backtest engine.")
+        raise NotImplementedError(
+            "LOWER_TIMEFRAME requires lower timeframe data and must be handled in the backtest engine."
+        )
 
     raise ValueError(f"Unsupported same_bar_rule: {same_bar_rule}")
