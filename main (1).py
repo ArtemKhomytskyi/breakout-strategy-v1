@@ -4,14 +4,13 @@ from AlgorithmImports import *
 
 import math
 import pandas as pd
-import numpy as np
 from datetime import timedelta
 
-# --- Your workspaces (must exist in the project root) ---
+# --- Your workspaces ---
 from swing_high_low_detection import swing_highs_lows_online
 
 from entry_exit import (
-    Bar,
+    Bar as SimBar,
     SwingLevels,
     PositionDirection,
     TakeProfitMode,
@@ -26,34 +25,27 @@ from stop_loss import StopLossManager
 from risk import RiskConfig, size_position
 
 
-class BosBreakoutV1_15m(QCAlgorithm):
+class BosBreakoutV1_15m_ETH(QCAlgorithm):
     """
-    Workspace-driven V1 engine on 15-minute bars (deterministic OHLC sim).
+    V1 BOS breakout on 15-minute bars, ETHUSD, workspace-driven.
 
-    IMPORTANT NOTE ABOUT QC UI:
-      - We do NOT place real orders (Market/Limit/Stop). Therefore QC's default
-        portfolio metrics (Net Profit, Holdings, Fees, Drawdown) will stay at 0.
-      - We plot a simulated equity curve ("Sim/Equity") based on our own PnL.
-
-    Fixes included:
-      - Streaming LEAN BOS fix: evaluate BOS on t-1 so entry is on Open[t]
-      - Crypto sizing fix: inject fractional sizing into plan_trade_from_signal
-      - StopLossManager state fix: reset before each planning attempt and on failures
-      - Progress logging so you can see if signals/trades exist during the run
+    IMPORTANT: This version simulates trades internally (OHLC rules),
+    and plots Sim/Equity. QC portfolio metrics will remain 0 because
+    we do NOT submit real orders (by design for deterministic V1).
     """
 
     def Initialize(self):
         # --------------------
-        # Backtest config
+        # Backtest config (shorter period for sanity)
         # --------------------
-        self.SetStartDate(2021, 1, 1)
-        self.SetEndDate(2024, 12, 31)
+        self.SetStartDate(2024, 1, 1)
+        self.SetEndDate(2025, 1, 1)
         self.SetCash(100000)
 
         # --------------------
-        # Asset + 15m bars via consolidator
+        # Asset + 15m consolidator
         # --------------------
-        self.symbol = self.AddCrypto("BTCUSD", Resolution.Minute).Symbol
+        self.symbol = self.AddCrypto("ETHUSD", Resolution.Minute).Symbol
         self.SetBenchmark(self.symbol)
 
         self.consolidator = TradeBarConsolidator(timedelta(minutes=15))
@@ -61,17 +53,21 @@ class BosBreakoutV1_15m(QCAlgorithm):
         self.SubscriptionManager.AddConsolidator(self.symbol, self.consolidator)
 
         # --------------------
-        # Strategy config (baseline from research)
+        # BEST CONFIG from your table screenshot (least-bad among shown)
+        # SL: structural, fixed_pct=0.005, buffer_pct=0.002
+        # TP: RANGE_BASED, tp_mult=1.0 (unused in RANGE_BASED)
+        # same_bar_rule: WORST_CASE
         # --------------------
-        self.sl_mode = "structural"      # "fixed" | "structural" | "bos"
+        self.sl_mode = "structural"
         self.fixed_pct = 0.005
         self.buffer_pct = 0.002
 
-        self.tp_mode = TakeProfitMode.RANGE_BASED  # RR_BASED | RANGE_BASED
+        self.tp_mode = TakeProfitMode.RANGE_BASED
         self.tp_mult = 1.0
 
         self.same_bar_rule = SameBarSlTpRule.WORST_CASE
 
+        # Risk sizing
         self.risk_config = RiskConfig(
             risk_budget_cash=100.0,
             max_quantity=None,
@@ -79,28 +75,31 @@ class BosBreakoutV1_15m(QCAlgorithm):
             use_buying_power_cap=False
         )
 
-        # Crypto supports fractional qty
+        # Crypto fractional sizing
         self.qty_decimals = 6
 
-        # Optional protections
+        # Protections (off for now)
         self.cooldown_bars = 0
         self.max_trades_per_day = None
 
         # --------------------
         # Swing detection params
+        # NOTE: your function uses a single last_swing_index across all N_candidates.
+        # Keep as-is, but start with a moderate set.
         # --------------------
         self.N_candidates = [5, 10, 20]
         self.N_confirmation = 3
         self.min_move_threshold = 0.0
         self.min_bars_between_swings = 3
 
-        self.required_warmup_bars = max(self.N_candidates) + self.N_confirmation + 10
+        self.required_warmup_bars = max(self.N_candidates) + self.N_confirmation + 20
 
         # --------------------
         # State
         # --------------------
         self.swing_levels = SwingLevels()
-
+        # Last valid (hi, lo) pair for RANGE_BASED TP
+        self.last_valid_range = None  # tuple[float, float] | None
         self.stop_loss_manager = StopLossManager(
             mode=self.sl_mode,
             fixed_pct=self.fixed_pct,
@@ -108,40 +107,34 @@ class BosBreakoutV1_15m(QCAlgorithm):
         )
 
         self.bars_15m = []  # list[Bar]
-        self.state = "FLAT"           # FLAT / LONG / SHORT
-        self.trade_plan = None        # TradePlan from entry_exit
+        self.trade_plan = None
+        self.state = "FLAT"  # FLAT/LONG/SHORT
 
         self._last_applied_swing_bar_index = -1
 
-        # Cooldown / daily
         self._bar_index = 0
         self._cooldown_until = -1
         self._current_day = None
         self._trades_today = 0
 
-        # Stats / debugging
+        # Stats
         self.stat_bos = 0
         self.stat_plan_ok = 0
         self.stat_plan_fail = 0
         self.stat_exit = 0
         self.stat_skip_qty0 = 0
+        self.stat_fail_logged = 0
 
-        # Trade log + simulated equity
+        # Sim equity + trades
         self.trades = []
         self.sim_equity = float(self.Portfolio.Cash)
         self.Plot("Sim", "Equity", self.sim_equity)
 
     def OnData(self, data: Slice):
-        # All logic is driven by consolidated 15m bars
         pass
 
-    # --------- Workspace-driven fractional sizing injection ----------
     def _position_sizer_fractional(self, **kwargs):
-        """
-        Uses your risk.size_position but allows fractional quantities
-        (prevents qty=0 from floor on BTC).
-        Must return: (qty: Optional[float], refuse_reason: Optional[str])
-        """
+        # Use your risk.size_position but allow fractional quantities
         qty, reason = size_position(
             **kwargs,
             round_func=lambda x: float(round(x, self.qty_decimals))
@@ -151,8 +144,7 @@ class BosBreakoutV1_15m(QCAlgorithm):
         return qty, reason
 
     def On15MinuteBar(self, sender, tb: TradeBar):
-        # Build your workspace Bar object
-        bar = Bar(
+        bar = SimBar(
             open=float(tb.Open),
             high=float(tb.High),
             low=float(tb.Low),
@@ -165,18 +157,19 @@ class BosBreakoutV1_15m(QCAlgorithm):
         self._bar_index += 1
         t = len(self.bars_15m) - 1
 
-        # Daily counters
+        # Daily reset
         day = tb.EndTime.date()
         if self._current_day is None or day != self._current_day:
             self._current_day = day
             self._trades_today = 0
 
-        # Progress log so you can see activity during the run
+        # Progress log (so you don't guess)
         if self._bar_index % 2000 == 0:
             self.Debug(
-                f"Progress {tb.EndTime} | bars={self._bar_index} | "
-                f"BOS={self.stat_bos} | PlanOK={self.stat_plan_ok} | "
-                f"PlanFail={self.stat_plan_fail} | Trades={len(self.trades)}"
+                f"{tb.EndTime} | bars={self._bar_index} | "
+                f"swing_hi={self.swing_levels.last_swing_high_price} swing_lo={self.swing_levels.last_swing_low_price} | "
+                f"BOS={self.stat_bos} PlanOK={self.stat_plan_ok} PlanFail={self.stat_plan_fail} "
+                f"Exits={self.stat_exit} Trades={len(self.trades)} SimEq={self.sim_equity:.2f}"
             )
 
         # Warmup
@@ -184,9 +177,9 @@ class BosBreakoutV1_15m(QCAlgorithm):
             return
 
         # ----------------------------
-        # 1) Update swings using your swing module (rolling window)
+        # 1) Update swings (rolling window)
         # ----------------------------
-        lookback = max(self.N_candidates) + self.N_confirmation + 200
+        lookback = max(self.N_candidates) + self.N_confirmation + 300
         start = max(0, len(self.bars_15m) - lookback)
         idx = list(range(start, len(self.bars_15m)))
 
@@ -208,24 +201,35 @@ class BosBreakoutV1_15m(QCAlgorithm):
         )
 
         confirmed = swings.dropna(subset=["HighLow", "Level"])
-        if len(confirmed) > 0:
+        if not confirmed.empty:
             for swing_idx, row in confirmed.iterrows():
                 swing_i = int(swing_idx)
                 if swing_i <= self._last_applied_swing_bar_index:
                     continue
 
-                hl = float(row["HighLow"])
-                lvl = float(row["Level"])
+            hl = float(row["HighLow"])
+            lvl = float(row["Level"])
 
-                self.swing_levels = update_last_swing_levels(
-                    self.swing_levels,
-                    highlow_flag=hl,
-                    level=lvl
-                )
-                self._last_applied_swing_bar_index = swing_i
+            # Update swing levels (your workspace function)
+            self.swing_levels = update_last_swing_levels(
+                self.swing_levels,
+                highlow_flag=hl,
+                level=lvl
+            )
+
+            # Maintain last_valid_range for RANGE_BASED:
+            hi = self.swing_levels.last_swing_high_price
+            lo = self.swing_levels.last_swing_low_price
+            if hi is not None and lo is not None:
+                if not (isinstance(hi, float) and math.isnan(hi)) and not (isinstance(lo, float) and math.isnan(lo)):
+                    if hi > lo:
+                        self.last_valid_range = (float(hi), float(lo))
+
+            self._last_applied_swing_bar_index = swing_i
+
 
         # ----------------------------
-        # 2) Exit check (workspace-driven)
+        # 2) Exit
         # ----------------------------
         if self.state in ("LONG", "SHORT") and self.trade_plan is not None:
             exit_event = check_exit_rules(
@@ -241,10 +245,8 @@ class BosBreakoutV1_15m(QCAlgorithm):
                 exit_price = float(exit_event.exit_price)
                 qty = float(self.trade_plan.quantity)
 
-                if self.trade_plan.direction == PositionDirection.LONG:
-                    pnl = (exit_price - entry_price) * qty
-                else:
-                    pnl = (entry_price - exit_price) * qty
+                pnl = (exit_price - entry_price) * qty if self.trade_plan.direction == PositionDirection.LONG \
+                      else (entry_price - exit_price) * qty
 
                 self.trades.append({
                     "entry_time": self.bars_15m[self.trade_plan.entry_candle_index].time,
@@ -264,11 +266,10 @@ class BosBreakoutV1_15m(QCAlgorithm):
 
                 self.stat_exit += 1
 
-                # Update simulated equity curve for QC charting
                 self.sim_equity += float(pnl)
                 self.Plot("Sim", "Equity", self.sim_equity)
 
-                # Reset position
+                # Reset state
                 self.state = "FLAT"
                 self.trade_plan = None
                 self.stop_loss_manager.reset()
@@ -276,73 +277,99 @@ class BosBreakoutV1_15m(QCAlgorithm):
                 if self.cooldown_bars and self.cooldown_bars > 0:
                     self._cooldown_until = self._bar_index + self.cooldown_bars
 
-                return  # no re-entry same bar
+                return
 
         # ----------------------------
-        # 3) Entry check (workspace-driven)
-        #    Streaming fix: evaluate BOS on (t-1), enter on Open[t]
+        # 3) Entry (streaming fix: evaluate BOS on t-1, enter on Open[t])
         # ----------------------------
-        if self.state == "FLAT":
-            if self.max_trades_per_day is not None and self._trades_today >= self.max_trades_per_day:
-                return
-            if self._bar_index < self._cooldown_until:
-                return
+        if self.state != "FLAT":
+            return
 
-            signal_t = t - 1
-            if signal_t < 0:
-                return
+        if self.max_trades_per_day is not None and self._trades_today >= self.max_trades_per_day:
+            return
+        if self._bar_index < self._cooldown_until:
+            return
 
-            bos_signal = detect_bos_signal(
-                bars=self.bars_15m,
-                t=signal_t,
-                swing_levels=self.swing_levels
-            )
-            if bos_signal is None:
-                return
+        signal_t = t - 1
+        if signal_t < 0:
+            return
 
-            self.stat_bos += 1
+        bos_signal = detect_bos_signal(
+            bars=self.bars_15m,
+            t=signal_t,
+            swing_levels=self.swing_levels
+        )
+        if bos_signal is None:
+            return
 
-            # Plan trade using your workspace planner, inject fractional sizing.
-            # StopLossManager can be left active if planning fails -> reset BEFORE and on failures.
-            self.stop_loss_manager.reset()
+        self.stat_bos += 1
 
-            try:
-                plan = plan_trade_from_signal(
-                    bars=self.bars_15m,
-                    bos_signal=bos_signal,
-                    swing_levels=self.swing_levels,
-                    stop_loss_manager=self.stop_loss_manager,
-                    tp_mode=self.tp_mode,
-                    tp_mult=self.tp_mult,
-                    risk_config=self.risk_config,
-                    buying_power_cash=None,
-                    position_sizer=self._position_sizer_fractional,
-                )
-            except Exception as e:
-                self.stop_loss_manager.reset()
+        # RANGE_BASED requires a valid stored range
+        if self.tp_mode == TakeProfitMode.RANGE_BASED:
+            if self.last_valid_range is None:
                 self.stat_plan_fail += 1
-                msg = str(e)
-                if "sized quantity is zero" in msg or "quantity is zero" in msg:
-                    self.stat_skip_qty0 += 1
+                if self.stat_fail_logged < 30:
+                    hi = self.swing_levels.last_swing_high_price
+                    lo = self.swing_levels.last_swing_low_price
+                    self.Debug(f"PLAN SKIP {tb.EndTime} | RANGE_BASED no valid range yet (hi={hi}, lo={lo})")
+                    self.stat_fail_logged += 1
                 return
 
-            # Accept plan (deterministic sim): entry is Open[t] already inside plan.entry_price
-            self.trade_plan = plan
-            self.state = "LONG" if plan.direction == PositionDirection.LONG else "SHORT"
-            self._trades_today += 1
-            self.stat_plan_ok += 1
+        # Build swing snapshot used for TP calculation inside plan_trade_from_signal
+        effective_swing_levels = self.swing_levels
+        if self.tp_mode == TakeProfitMode.RANGE_BASED and self.last_valid_range is not None:
+            hi, lo = self.last_valid_range
+            effective_swing_levels = SwingLevels(last_swing_high_price=hi, last_swing_low_price=lo)
 
-            if self.cooldown_bars and self.cooldown_bars > 0:
-                self._cooldown_until = self._bar_index + self.cooldown_bars
+
+
+        # StopLossManager safety: always reset before planning and on failure
+        self.stop_loss_manager.reset()
+
+        try:
+            plan = plan_trade_from_signal(
+                bars=self.bars_15m,
+                bos_signal=bos_signal,
+                swing_levels=self.swing_levels,
+                stop_loss_manager=self.stop_loss_manager,
+                tp_mode=self.tp_mode,
+                tp_mult=self.tp_mult,
+                risk_config=self.risk_config,
+                buying_power_cash=None,
+                position_sizer=self._position_sizer_fractional
+            )
+        except Exception as e:
+            self.stop_loss_manager.reset()
+            self.stat_plan_fail += 1
+
+            msg = str(e)
+            if "sized quantity is zero" in msg or "quantity is zero" in msg:
+                self.stat_skip_qty0 += 1
+
+            # Log first 30 failures for diagnosis
+            if self.stat_fail_logged < 30:
+                self.Debug(f"PLAN FAIL {tb.EndTime} | {e}")
+                self.stat_fail_logged += 1
+
+            return
+
+        # Accept plan
+        self.trade_plan = plan
+        self.state = "LONG" if plan.direction == PositionDirection.LONG else "SHORT"
+        self._trades_today += 1
+        self.stat_plan_ok += 1
+
+        if self.cooldown_bars and self.cooldown_bars > 0:
+            self._cooldown_until = self._bar_index + self.cooldown_bars
 
     def OnEndOfAlgorithm(self):
         n = len(self.trades)
         total_pnl = sum(t["pnl"] for t in self.trades) if n else 0.0
 
-        self.Debug(f"15m DONE | Trades: {n} | TotalPnL (OHLC sim): {total_pnl:.2f} | SimEquity: {self.sim_equity:.2f}")
         self.Debug(
-            f"BOS: {self.stat_bos} | PlanOK: {self.stat_plan_ok} | PlanFail: {self.stat_plan_fail} "
-            f"| Exits: {self.stat_exit} | Qty0Skips: {self.stat_skip_qty0}"
+            f"DONE | Trades={n} | TotalPnL(sim)={total_pnl:.2f} | SimEquity={self.sim_equity:.2f} | "
+            f"BOS={self.stat_bos} PlanOK={self.stat_plan_ok} PlanFail={self.stat_plan_fail} "
+            f"Exits={self.stat_exit} Qty0Skips={self.stat_skip_qty0}"
         )
 
         for i, tr in enumerate(self.trades[:5]):
