@@ -1,0 +1,12 @@
+symbol: ETHUSDT
+exchange: bybit
+market: linear_perpetual
+timeframe: 15m
+timezone: UTC
+start_timestamp: '2021-07-05 12:00:00+00:00'
+end_timestamp: '2025-06-28 20:30:00+00:00'
+gap_policy: segment_id
+rolling_windows:
+- 20
+- 50
+notes: Features are online-safe. Rolling is computed per segment_id.
