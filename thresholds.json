@@ -1,0 +1,7 @@
+{
+  "threshold_high": 0.7520163391941913,
+  "threshold_low": 0.8168368236826667,
+  "left": 10,
+  "right": 10,
+  "selection_rule": "max_f1_on_valid"
+}
