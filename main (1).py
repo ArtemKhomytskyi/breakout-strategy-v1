@@ -6,9 +6,7 @@ import math
 import pandas as pd
 from datetime import timedelta
 
-# --- Your workspaces ---
 from swing_high_low_detection import swing_highs_lows_online
-
 from entry_exit import (
     Bar as SimBar,
     SwingLevels,
@@ -20,310 +18,169 @@ from entry_exit import (
     plan_trade_from_signal,
     check_exit_rules,
 )
-
 from stop_loss import StopLossManager
 from risk import RiskConfig, size_position
 
 
-class BosBreakoutV1_15m_ETH(QCAlgorithm):
+class BosBreakoutEth15m(QCAlgorithm):
     """
-    V1 BOS breakout on 15-minute bars, ETHUSD, workspace-driven.
+    ETHUSD 15-minute BOS strategy for QuantConnect.
 
-    IMPORTANT: This version simulates trades internally (OHLC rules),
-    and plots Sim/Equity. QC portfolio metrics will remain 0 because
-    we do NOT submit real orders (by design for deterministic V1).
+    Uses project mechanics:
+    - swing_highs_lows_online
+    - detect_bos_signal
+    - plan_trade_from_signal
+    - StopLossManager
+    - risk.size_position
+    - check_exit_rules (same-bar handling)
     """
 
     def Initialize(self):
-        # --------------------
-        # Backtest config (shorter period for sanity)
-        # --------------------
-        self.SetStartDate(2024, 1, 1)
+        self.SetTimeZone("UTC")
+        self.SetStartDate(2021, 1, 1)
         self.SetEndDate(2025, 1, 1)
         self.SetCash(100000)
 
-        # --------------------
-        # Asset + 15m consolidator
-        # --------------------
         self.symbol = self.AddCrypto("ETHUSD", Resolution.Minute).Symbol
         self.SetBenchmark(self.symbol)
 
-        self.consolidator = TradeBarConsolidator(timedelta(minutes=15))
-        self.consolidator.DataConsolidated += self.On15MinuteBar
-        self.SubscriptionManager.AddConsolidator(self.symbol, self.consolidator)
+        # Best parameters from your research
+        self.sl_mode = "fixed"
+        self.fixed_pct = 0.0100
+        self.buffer_pct = 0.000
 
-        # --------------------
-        # BEST CONFIG from your table screenshot (least-bad among shown)
-        # SL: structural, fixed_pct=0.005, buffer_pct=0.002
-        # TP: RANGE_BASED, tp_mult=1.0 (unused in RANGE_BASED)
-        # same_bar_rule: WORST_CASE
-        # --------------------
-        self.sl_mode = "structural"
-        self.fixed_pct = 0.005
-        self.buffer_pct = 0.002
-
-        self.tp_mode = TakeProfitMode.RANGE_BASED
-        self.tp_mult = 1.0
+        self.tp_mode = TakeProfitMode.RR_BASED
+        self.tp_mult = 3.0
 
         self.same_bar_rule = SameBarSlTpRule.WORST_CASE
+        self.cooldown_bars = 0
+        self.max_trades_per_day = None
 
-        # Risk sizing
+        # Keep same risk sizing style from project
         self.risk_config = RiskConfig(
             risk_budget_cash=100.0,
             max_quantity=None,
             min_risk_per_unit=None,
-            use_buying_power_cap=False
+            use_buying_power_cap=False,
         )
-
-        # Crypto fractional sizing
         self.qty_decimals = 6
 
-        # Protections (off for now)
-        self.cooldown_bars = 0
-        self.max_trades_per_day = None
-
-        # --------------------
-        # Swing detection params
-        # NOTE: your function uses a single last_swing_index across all N_candidates.
-        # Keep as-is, but start with a moderate set.
-        # --------------------
+        # Swing detection parameters
         self.N_candidates = [5, 10, 20]
         self.N_confirmation = 3
         self.min_move_threshold = 0.0
         self.min_bars_between_swings = 3
-
         self.required_warmup_bars = max(self.N_candidates) + self.N_confirmation + 20
 
-        # --------------------
-        # State
-        # --------------------
-        self.swing_levels = SwingLevels()
-        # Last valid (hi, lo) pair for RANGE_BASED TP
-        self.last_valid_range = None  # tuple[float, float] | None
         self.stop_loss_manager = StopLossManager(
             mode=self.sl_mode,
             fixed_pct=self.fixed_pct,
-            buffer_pct=self.buffer_pct
+            buffer_pct=self.buffer_pct,
         )
 
-        self.bars_15m = []  # list[Bar]
+        self.swing_levels = SwingLevels()
+        self.bars_15m = []
+        self.last_applied_swing_bar_index = -1
+
+        self.bar_index = 0
+        self.cooldown_until = -1
+        self.current_day = None
+        self.trades_today = 0
+
+        # Trade state
+        self.state = "FLAT"  # FLAT | ENTRY_SUBMITTED | OPEN | EXIT_SUBMITTED
         self.trade_plan = None
-        self.state = "FLAT"  # FLAT/LONG/SHORT
-
-        self._last_applied_swing_bar_index = -1
-
-        self._bar_index = 0
-        self._cooldown_until = -1
-        self._current_day = None
-        self._trades_today = 0
+        self.entry_ticket = None
+        self.exit_ticket = None
+        self.active_qty = 0.0
+        self.active_sl_price = None
+        self.active_tp_price = None
+        self.pending_exit_reason = None
+        self.pending_exit_price = None
+        self.entry_fill_price = None
+        self.entry_fill_time = None
 
         # Stats
         self.stat_bos = 0
         self.stat_plan_ok = 0
         self.stat_plan_fail = 0
-        self.stat_exit = 0
         self.stat_skip_qty0 = 0
-        self.stat_fail_logged = 0
+        self.stat_entries = 0
+        self.stat_exit = 0
+        self.stat_sl = 0
+        self.stat_tp = 0
+        self.stat_entry_reject = 0
+        self.plan_fail_log_count = 0
+        self.total_trade_pnl = 0.0
 
-        # Sim equity + trades
-        self.trades = []
-        self.sim_equity = float(self.Portfolio.Cash)
-        self.Plot("Sim", "Equity", self.sim_equity)
+        self.consolidator = TradeBarConsolidator(timedelta(minutes=15))
+        self.consolidator.DataConsolidated += self.On15MinuteBar
+        self.SubscriptionManager.AddConsolidator(self.symbol, self.consolidator)
+
+        self.Debug(
+            "READY | ETHUSD 15m | sl=fixed(1%), tp=RR(3.0), same_bar=WORST_CASE, cooldown=0, max_trades_day=None"
+        )
 
     def OnData(self, data: Slice):
         pass
 
-    def _position_sizer_fractional(self, **kwargs):
-        # Use your risk.size_position but allow fractional quantities
-        qty, reason = size_position(
-            **kwargs,
-            round_func=lambda x: float(round(x, self.qty_decimals))
-        )
-        if qty is not None and qty <= 0:
-            return None, "qty <= 0 after rounding"
-        return qty, reason
-
     def On15MinuteBar(self, sender, tb: TradeBar):
-        bar = SimBar(
+        sim_bar = SimBar(
             open=float(tb.Open),
             high=float(tb.High),
             low=float(tb.Low),
             close=float(tb.Close),
             volume=float(tb.Volume) if tb.Volume is not None else None,
-            time=str(tb.EndTime)
+            time=str(tb.EndTime),
         )
 
-        self.bars_15m.append(bar)
-        self._bar_index += 1
-        t = len(self.bars_15m) - 1
+        self.bars_15m.append(sim_bar)
+        self.bar_index += 1
 
-        # Daily reset
+        self.Plot("Price", "Close", sim_bar.close)
+
         day = tb.EndTime.date()
-        if self._current_day is None or day != self._current_day:
-            self._current_day = day
-            self._trades_today = 0
+        if self.current_day is None or day != self.current_day:
+            self.current_day = day
+            self.trades_today = 0
 
-        # Progress log (so you don't guess)
-        if self._bar_index % 2000 == 0:
-            self.Debug(
-                f"{tb.EndTime} | bars={self._bar_index} | "
-                f"swing_hi={self.swing_levels.last_swing_high_price} swing_lo={self.swing_levels.last_swing_low_price} | "
-                f"BOS={self.stat_bos} PlanOK={self.stat_plan_ok} PlanFail={self.stat_plan_fail} "
-                f"Exits={self.stat_exit} Trades={len(self.trades)} SimEq={self.sim_equity:.2f}"
-            )
-
-        # Warmup
         if len(self.bars_15m) < self.required_warmup_bars:
             return
 
-        # ----------------------------
-        # 1) Update swings (rolling window)
-        # ----------------------------
-        lookback = max(self.N_candidates) + self.N_confirmation + 300
-        start = max(0, len(self.bars_15m) - lookback)
-        idx = list(range(start, len(self.bars_15m)))
+        self._update_swings()
+        self._plot_levels()
+        self._heal_state_if_needed()
 
-        ohlc = pd.DataFrame(
-            {
-                "close": [self.bars_15m[i].close for i in idx],
-                "high":  [self.bars_15m[i].high for i in idx],
-                "low":   [self.bars_15m[i].low for i in idx],
-            },
-            index=idx
-        )
-
-        swings = swing_highs_lows_online(
-            ohlc,
-            N_candidates=self.N_candidates,
-            N_confirmation=self.N_confirmation,
-            min_move_threshold=self.min_move_threshold,
-            min_bars_between_swings=self.min_bars_between_swings
-        )
-
-        confirmed = swings.dropna(subset=["HighLow", "Level"])
-        if not confirmed.empty:
-            for swing_idx, row in confirmed.iterrows():
-                swing_i = int(swing_idx)
-                if swing_i <= self._last_applied_swing_bar_index:
-                    continue
-
-            hl = float(row["HighLow"])
-            lvl = float(row["Level"])
-
-            # Update swing levels (your workspace function)
-            self.swing_levels = update_last_swing_levels(
-                self.swing_levels,
-                highlow_flag=hl,
-                level=lvl
-            )
-
-            # Maintain last_valid_range for RANGE_BASED:
-            hi = self.swing_levels.last_swing_high_price
-            lo = self.swing_levels.last_swing_low_price
-            if hi is not None and lo is not None:
-                if not (isinstance(hi, float) and math.isnan(hi)) and not (isinstance(lo, float) and math.isnan(lo)):
-                    if hi > lo:
-                        self.last_valid_range = (float(hi), float(lo))
-
-            self._last_applied_swing_bar_index = swing_i
-
-
-        # ----------------------------
-        # 2) Exit
-        # ----------------------------
-        if self.state in ("LONG", "SHORT") and self.trade_plan is not None:
-            exit_event = check_exit_rules(
-                bar=bar,
-                direction=self.trade_plan.direction,
-                sl_price=self.trade_plan.sl_price,
-                tp_price=self.trade_plan.tp_price,
-                same_bar_rule=self.same_bar_rule
-            )
-
-            if exit_event is not None:
-                entry_price = float(self.trade_plan.entry_price)
-                exit_price = float(exit_event.exit_price)
-                qty = float(self.trade_plan.quantity)
-
-                pnl = (exit_price - entry_price) * qty if self.trade_plan.direction == PositionDirection.LONG \
-                      else (entry_price - exit_price) * qty
-
-                self.trades.append({
-                    "entry_time": self.bars_15m[self.trade_plan.entry_candle_index].time,
-                    "exit_time": bar.time,
-                    "direction": self.trade_plan.direction.value,
-                    "entry_price": entry_price,
-                    "sl_price": float(self.trade_plan.sl_price),
-                    "tp_price": float(self.trade_plan.tp_price),
-                    "exit_price": exit_price,
-                    "exit_reason": exit_event.exit_reason.value,
-                    "qty": qty,
-                    "pnl": float(pnl),
-                    "signal_index": int(self.trade_plan.signal_candle_index),
-                    "entry_index": int(self.trade_plan.entry_candle_index),
-                    "exit_index": int(t),
-                })
-
-                self.stat_exit += 1
-
-                self.sim_equity += float(pnl)
-                self.Plot("Sim", "Equity", self.sim_equity)
-
-                # Reset state
-                self.state = "FLAT"
-                self.trade_plan = None
-                self.stop_loss_manager.reset()
-
-                if self.cooldown_bars and self.cooldown_bars > 0:
-                    self._cooldown_until = self._bar_index + self.cooldown_bars
-
+        if self.state == "OPEN":
+            if self._try_exit_with_v1_rules(sim_bar):
                 return
 
-        # ----------------------------
-        # 3) Entry (streaming fix: evaluate BOS on t-1, enter on Open[t])
-        # ----------------------------
         if self.state != "FLAT":
             return
 
-        if self.max_trades_per_day is not None and self._trades_today >= self.max_trades_per_day:
-            return
-        if self._bar_index < self._cooldown_until:
+        if self.max_trades_per_day is not None and self.trades_today >= self.max_trades_per_day:
             return
 
-        signal_t = t - 1
+        if self.cooldown_bars > 0 and self.bar_index < self.cooldown_until:
+            return
+
+        if self._has_open_orders():
+            return
+
+        # Streaming approach from your project: signal on t-1, entry planned on bar t open.
+        signal_t = len(self.bars_15m) - 2
         if signal_t < 0:
             return
 
         bos_signal = detect_bos_signal(
             bars=self.bars_15m,
             t=signal_t,
-            swing_levels=self.swing_levels
+            swing_levels=self.swing_levels,
         )
         if bos_signal is None:
             return
 
         self.stat_bos += 1
-
-        # RANGE_BASED requires a valid stored range
-        if self.tp_mode == TakeProfitMode.RANGE_BASED:
-            if self.last_valid_range is None:
-                self.stat_plan_fail += 1
-                if self.stat_fail_logged < 30:
-                    hi = self.swing_levels.last_swing_high_price
-                    lo = self.swing_levels.last_swing_low_price
-                    self.Debug(f"PLAN SKIP {tb.EndTime} | RANGE_BASED no valid range yet (hi={hi}, lo={lo})")
-                    self.stat_fail_logged += 1
-                return
-
-        # Build swing snapshot used for TP calculation inside plan_trade_from_signal
-        effective_swing_levels = self.swing_levels
-        if self.tp_mode == TakeProfitMode.RANGE_BASED and self.last_valid_range is not None:
-            hi, lo = self.last_valid_range
-            effective_swing_levels = SwingLevels(last_swing_high_price=hi, last_swing_low_price=lo)
-
-
-
-        # StopLossManager safety: always reset before planning and on failure
         self.stop_loss_manager.reset()
 
         try:
@@ -335,42 +192,290 @@ class BosBreakoutV1_15m_ETH(QCAlgorithm):
                 tp_mode=self.tp_mode,
                 tp_mult=self.tp_mult,
                 risk_config=self.risk_config,
-                buying_power_cash=None,
-                position_sizer=self._position_sizer_fractional
+                buying_power_cash=float(self.Portfolio.Cash),
+                position_sizer=self._position_sizer_fractional,
             )
         except Exception as e:
             self.stop_loss_manager.reset()
             self.stat_plan_fail += 1
 
-            msg = str(e)
-            if "sized quantity is zero" in msg or "quantity is zero" in msg:
+            err = str(e)
+            if "sized quantity is zero" in err or "quantity is zero" in err:
                 self.stat_skip_qty0 += 1
 
-            # Log first 30 failures for diagnosis
-            if self.stat_fail_logged < 30:
+            if self.plan_fail_log_count < 25:
                 self.Debug(f"PLAN FAIL {tb.EndTime} | {e}")
-                self.stat_fail_logged += 1
-
+                self.plan_fail_log_count += 1
             return
 
-        # Accept plan
+        signed_qty = plan.quantity if plan.direction == PositionDirection.LONG else -plan.quantity
+        signed_qty = self._round_quantity(float(signed_qty))
+        if signed_qty == 0:
+            self.stat_skip_qty0 += 1
+            return
+
+        sl_price = self._round_price(float(plan.sl_price))
+        tp_price = self._round_price(float(plan.tp_price))
+
+        if not self._is_valid_bracket(plan.direction, float(plan.entry_price), sl_price, tp_price):
+            self.stat_plan_fail += 1
+            return
+
         self.trade_plan = plan
-        self.state = "LONG" if plan.direction == PositionDirection.LONG else "SHORT"
-        self._trades_today += 1
+        self.active_sl_price = sl_price
+        self.active_tp_price = tp_price
+        self.pending_exit_reason = None
+        self.pending_exit_price = None
+        self.entry_fill_price = None
+        self.entry_fill_time = None
+
+        self.state = "ENTRY_SUBMITTED"
+        self.entry_ticket = self.MarketOrder(
+            self.symbol,
+            signed_qty,
+            tag=f"ENTRY|{plan.direction.value}|sig={plan.signal_candle_index}",
+        )
         self.stat_plan_ok += 1
 
-        if self.cooldown_bars and self.cooldown_bars > 0:
-            self._cooldown_until = self._bar_index + self.cooldown_bars
+    def OnOrderEvent(self, orderEvent: OrderEvent):
+        if self.entry_ticket and orderEvent.OrderId == self.entry_ticket.OrderId:
+            if orderEvent.Status in [OrderStatus.Filled, OrderStatus.PartiallyFilled]:
+                filled_qty = float(self.entry_ticket.QuantityFilled)
+                if filled_qty != 0:
+                    self.active_qty = filled_qty
+                    if self.entry_fill_time is None:
+                        self.entry_fill_time = self.Time
+                        if orderEvent.FillPrice > 0:
+                            self.entry_fill_price = float(orderEvent.FillPrice)
+                        else:
+                            self.entry_fill_price = float(self.trade_plan.entry_price)
+
+                        self.state = "OPEN"
+                        self.trades_today += 1
+                        self.stat_entries += 1
+                        self.Debug(
+                            f"ENTRY {self.Time} | Qty={filled_qty:.6f} "
+                            f"Entry={self.entry_fill_price:.2f} "
+                            f"SL={self.active_sl_price:.2f} TP={self.active_tp_price:.2f}"
+                        )
+                return
+
+            if orderEvent.Status in [OrderStatus.Canceled, OrderStatus.Invalid]:
+                self.stat_entry_reject += 1
+                if self.plan_fail_log_count < 25:
+                    self.Debug(f"ENTRY REJECTED {self.Time} | {orderEvent.Message}")
+                    self.plan_fail_log_count += 1
+                self._clear_trade_state(mark_cooldown=False)
+                return
+
+        if self.exit_ticket and orderEvent.OrderId == self.exit_ticket.OrderId:
+            if orderEvent.Status in [OrderStatus.Filled, OrderStatus.PartiallyFilled]:
+                if self.Portfolio[self.symbol].Invested:
+                    return
+
+                fill_price = float(orderEvent.FillPrice) if orderEvent.FillPrice > 0 else 0.0
+                reason = self.pending_exit_reason if self.pending_exit_reason is not None else "UNKNOWN"
+
+                if reason == "SL":
+                    self.stat_sl += 1
+                elif reason == "TP":
+                    self.stat_tp += 1
+
+                self.stat_exit += 1
+
+                if self.entry_fill_price is not None and fill_price > 0 and self.active_qty != 0:
+                    pnl = (fill_price - self.entry_fill_price) * self.active_qty
+                    self.total_trade_pnl += pnl
+
+                model_exit = f"{self.pending_exit_price:.2f}" if self.pending_exit_price is not None else "n/a"
+                self.Debug(
+                    f"EXIT {self.Time} | Reason={reason} Fill={fill_price:.2f} ModelExit={model_exit}"
+                )
+                self._clear_trade_state(mark_cooldown=True)
+                return
+
+            if orderEvent.Status in [OrderStatus.Canceled, OrderStatus.Invalid]:
+                if self.Portfolio[self.symbol].Invested:
+                    self.Liquidate(self.symbol, "Exit order failed")
+                self._clear_trade_state(mark_cooldown=True)
+                return
 
     def OnEndOfAlgorithm(self):
-        n = len(self.trades)
-        total_pnl = sum(t["pnl"] for t in self.trades) if n else 0.0
-
         self.Debug(
-            f"DONE | Trades={n} | TotalPnL(sim)={total_pnl:.2f} | SimEquity={self.sim_equity:.2f} | "
+            f"DONE | Trades={self.stat_entries} Exits={self.stat_exit} SL={self.stat_sl} TP={self.stat_tp} "
             f"BOS={self.stat_bos} PlanOK={self.stat_plan_ok} PlanFail={self.stat_plan_fail} "
-            f"Exits={self.stat_exit} Qty0Skips={self.stat_skip_qty0}"
+            f"Qty0Skips={self.stat_skip_qty0} EntryReject={self.stat_entry_reject} "
+            f"ApproxPnL={self.total_trade_pnl:.2f}"
         )
 
-        for i, tr in enumerate(self.trades[:5]):
-            self.Debug(f"Trade[{i}]: {tr}")
+    def _update_swings(self):
+        lookback = max(self.N_candidates) + self.N_confirmation + 300
+        start = max(0, len(self.bars_15m) - lookback)
+        idx = list(range(start, len(self.bars_15m)))
+
+        ohlc = pd.DataFrame(
+            {
+                "close": [self.bars_15m[i].close for i in idx],
+                "high": [self.bars_15m[i].high for i in idx],
+                "low": [self.bars_15m[i].low for i in idx],
+            },
+            index=idx,
+        )
+
+        swings = swing_highs_lows_online(
+            ohlc,
+            N_candidates=self.N_candidates,
+            N_confirmation=self.N_confirmation,
+            min_move_threshold=self.min_move_threshold,
+            min_bars_between_swings=self.min_bars_between_swings,
+        )
+
+        confirmed = swings.dropna(subset=["HighLow", "Level"])
+        if confirmed.empty:
+            return
+
+        for swing_idx, row in confirmed.iterrows():
+            swing_i = int(swing_idx)
+            if swing_i <= self.last_applied_swing_bar_index:
+                continue
+
+            hl = float(row["HighLow"])
+            lvl = float(row["Level"])
+
+            self.swing_levels = update_last_swing_levels(
+                self.swing_levels,
+                highlow_flag=hl,
+                level=lvl,
+            )
+            self.last_applied_swing_bar_index = swing_i
+
+    def _try_exit_with_v1_rules(self, bar: SimBar) -> bool:
+        if self.trade_plan is None:
+            return False
+
+        if not self.Portfolio[self.symbol].Invested:
+            return False
+
+        if self.exit_ticket is not None and self._has_open_orders():
+            return True
+
+        exit_event = check_exit_rules(
+            bar=bar,
+            direction=self.trade_plan.direction,
+            sl_price=float(self.active_sl_price),
+            tp_price=float(self.active_tp_price),
+            same_bar_rule=self.same_bar_rule,
+        )
+        if exit_event is None:
+            return False
+
+        qty_to_close = -float(self.Portfolio[self.symbol].Quantity)
+        qty_to_close = self._round_quantity(qty_to_close)
+
+        if qty_to_close == 0:
+            self._clear_trade_state(mark_cooldown=True)
+            return True
+
+        self.pending_exit_reason = exit_event.exit_reason.value
+        self.pending_exit_price = float(exit_event.exit_price)
+
+        self.state = "EXIT_SUBMITTED"
+        self.exit_ticket = self.MarketOrder(
+            self.symbol,
+            qty_to_close,
+            tag=f"EXIT|{self.pending_exit_reason}",
+        )
+        return True
+
+    def _position_sizer_fractional(self, **kwargs):
+        qty, reason = size_position(
+            **kwargs,
+            round_func=lambda x: float(round(x, self.qty_decimals)),
+        )
+        if qty is not None and qty <= 0:
+            return None, "qty <= 0 after rounding"
+        return qty, reason
+
+    def _is_valid_bracket(self, direction: PositionDirection, entry: float, sl: float, tp: float) -> bool:
+        if entry <= 0 or sl <= 0 or tp <= 0:
+            return False
+
+        if direction == PositionDirection.LONG:
+            return sl < entry < tp
+
+        return tp < entry < sl
+
+    def _round_price(self, price: float) -> float:
+        security = self.Securities[self.symbol]
+        tick = float(security.SymbolProperties.MinimumPriceVariation)
+        if tick <= 0:
+            return float(price)
+
+        return float(round(price / tick) * tick)
+
+    def _round_quantity(self, qty: float) -> float:
+        if qty == 0:
+            return 0.0
+
+        security = self.Securities[self.symbol]
+        lot = float(security.SymbolProperties.LotSize)
+
+        abs_qty = abs(float(qty))
+        if lot > 0:
+            steps = math.floor(abs_qty / lot)
+            abs_qty = steps * lot
+
+        abs_qty = float(round(abs_qty, self.qty_decimals))
+        if abs_qty <= 0:
+            return 0.0
+
+        return abs_qty if qty > 0 else -abs_qty
+
+    def _plot_levels(self):
+        hi = self.swing_levels.last_swing_high_price
+        lo = self.swing_levels.last_swing_low_price
+
+        if hi is not None:
+            self.Plot("Levels", "SwingHigh", float(hi))
+        if lo is not None:
+            self.Plot("Levels", "SwingLow", float(lo))
+
+        if self.state == "OPEN" and self.active_sl_price is not None and self.active_tp_price is not None:
+            self.Plot("Levels", "SL", float(self.active_sl_price))
+            self.Plot("Levels", "TP", float(self.active_tp_price))
+
+    def _has_open_orders(self) -> bool:
+        return len(self.Transactions.GetOpenOrders(self.symbol)) > 0
+
+    def _heal_state_if_needed(self):
+        if self.state == "OPEN":
+            if not self.Portfolio[self.symbol].Invested and not self._has_open_orders():
+                self._clear_trade_state(mark_cooldown=False)
+                return
+
+        if self.state == "ENTRY_SUBMITTED":
+            if not self.Portfolio[self.symbol].Invested and not self._has_open_orders():
+                self._clear_trade_state(mark_cooldown=False)
+                return
+
+        if self.state == "EXIT_SUBMITTED":
+            if not self.Portfolio[self.symbol].Invested and not self._has_open_orders():
+                self._clear_trade_state(mark_cooldown=True)
+
+    def _clear_trade_state(self, mark_cooldown: bool):
+        self.stop_loss_manager.reset()
+
+        self.state = "FLAT"
+        self.trade_plan = None
+        self.entry_ticket = None
+        self.exit_ticket = None
+        self.active_qty = 0.0
+        self.active_sl_price = None
+        self.active_tp_price = None
+        self.pending_exit_reason = None
+        self.pending_exit_price = None
+        self.entry_fill_price = None
+        self.entry_fill_time = None
+
+        if mark_cooldown and self.cooldown_bars > 0:
+            self.cooldown_until = self.bar_index + self.cooldown_bars
