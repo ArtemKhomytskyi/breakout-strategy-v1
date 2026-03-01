@@ -3,8 +3,18 @@ from AlgorithmImports import *
 # endregion
 
 import math
+import sys
 import pandas as pd
 from datetime import timedelta
+from pathlib import Path
+
+# Centralize workspace-relative imports here so folder moves do not require
+# editing every local import in the file.
+ALGO_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = ALGO_DIR.parent
+
+if str(ALGO_DIR) not in sys.path:
+    sys.path.insert(0, str(ALGO_DIR))
 
 # --- Your workspaces ---
 from swing_high_low_detection import swing_highs_lows_online

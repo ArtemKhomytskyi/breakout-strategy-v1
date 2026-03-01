@@ -1,5 +1,20 @@
 from __future__ import annotations
 
+"""Online ML swing detector driven by fractal-trained model artifacts.
+
+This module bridges offline training outputs and bar-by-bar runtime usage.
+The detector scores each incoming bar, stores the prediction until the
+right-side confirmation delay has elapsed, and then emits confirmed swing
+events through ``pop_confirmed()``.
+
+Runtime contract:
+- probabilities are produced at bar ``t``
+- a swing candidate at ``t`` becomes confirmable only when ``t + right`` is seen
+- external feature rows are preferred because they match training-time features
+- a fallback OHLC-only feature builder exists for quick experiments, but it is
+  only an approximation of the training pipeline
+"""
+
 import json
 import math
 import pickle
@@ -84,6 +99,8 @@ class SwingDetectorMLFractal:
         self._bar_index = -1
         self._last_p_high = float("nan")
         self._last_p_low = float("nan")
+        # Buffer the last right+1 bars so the oldest entry becomes confirmable
+        # exactly when the current bar closes the confirmation window.
         self._buffer: Deque[Dict[str, float]] = deque(maxlen=self.right + 1)
 
         self._last_confirmed_swing_index = -10**9
@@ -146,6 +163,8 @@ class SwingDetectorMLFractal:
             return
 
         swing_index = self._bar_index - self.right
+        # The leftmost buffered item corresponds to the bar that has just
+        # matured past the right-side confirmation delay.
         candidate = self._buffer[0]
 
         self._try_confirm(
@@ -204,6 +223,8 @@ class SwingDetectorMLFractal:
         if len(self.feature_names) == n_exp:
             return
 
+        # Some research artifacts keep segment_id in the saved feature config
+        # even when the trained sklearn model was fit without it.
         if "segment_id" in self.feature_names and len(self.feature_names) - 1 == n_exp:
             self.feature_names = [f for f in self.feature_names if f != "segment_id"]
             return
@@ -256,6 +277,9 @@ class SwingDetectorMLFractal:
         rets = (closes[1:] / np.maximum(closes[:-1], self.eps)) - 1.0
         vol_50 = float(np.std(rets[-50:], ddof=0))
 
+        # Mirror the broad shape of the engineered training features so the
+        # detector can still be exercised when an external feature row is
+        # unavailable in a notebook or replay test.
         values_map: Dict[str, float] = {
             "ret_1": float(ret_1),
             "ret_3": float(ret_3),
@@ -291,6 +315,8 @@ class SwingDetectorMLFractal:
         if not is_high and not is_low:
             return
 
+        # If both sides clear threshold on the same bar, keep only the side
+        # with the larger margin above its threshold.
         if is_high and is_low:
             if (p_high - self.threshold_high) >= (p_low - self.threshold_low):
                 is_low = False

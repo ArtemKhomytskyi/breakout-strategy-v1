@@ -1,0 +1,8 @@
+{
+  "symbol": "ETHUSDT",
+  "timeframe": "15m",
+  "labels": "fractal_L10_R10",
+  "random_seed": 42,
+  "features_source": "ML v1/data/ETHUSDT_15m_features_reduced.parquet",
+  "labels_source": "ML v1/data/ETHUSDT_15m_fractal_labels_L10_R10.parquet"
+}

@@ -1,6 +1,15 @@
 import math
-from entry_exit import Bar, PositionDirection, has_level
+import sys
+from pathlib import Path
 from typing import Optional
+
+# Keep local module imports resilient to project folder moves and cwd changes.
+ALGO_DIR = Path(__file__).resolve().parent
+
+if str(ALGO_DIR) not in sys.path:
+    sys.path.insert(0, str(ALGO_DIR))
+
+from entry_exit import Bar, PositionDirection, has_level
 
 
 class StopLossManager:
