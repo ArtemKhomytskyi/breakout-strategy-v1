@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from entry_exit import PositionDirection
+    from code.entry_exit import PositionDirection
 
 
 @dataclass(frozen=True)

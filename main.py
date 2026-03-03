@@ -6,8 +6,8 @@ import math
 import pandas as pd
 from datetime import timedelta
 
-from swing_high_low_detection import swing_highs_lows_online
-from entry_exit import (
+from code.swing_high_low_detection import swing_highs_lows_online
+from code.entry_exit import (
     Bar as SimBar,
     SwingLevels,
     PositionDirection,
@@ -18,8 +18,8 @@ from entry_exit import (
     plan_trade_from_signal,
     check_exit_rules,
 )
-from stop_loss import StopLossManager
-from risk import RiskConfig, size_position
+from code.stop_loss import StopLossManager
+from code.risk import RiskConfig, size_position
 
 
 class BosBreakoutEth15m(QCAlgorithm):

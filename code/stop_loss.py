@@ -1,5 +1,5 @@
 import math
-from entry_exit import Bar, PositionDirection, has_level
+from code.entry_exit import Bar, PositionDirection, has_level
 from typing import Optional
 
 

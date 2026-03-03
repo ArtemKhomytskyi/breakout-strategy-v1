@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
-from risk import RiskConfig, size_position
+from code.risk import RiskConfig, size_position
 
 # IMPORTANT:
 # If your stop_loss module imports Bar and PositionDirection from this file,
