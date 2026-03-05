@@ -1,7 +1,0 @@
-{
-  "threshold_high": 0.85,
-  "threshold_low": 0.85,
-  "left": 10,
-  "right": 10,
-  "selection_rule": "ratio_matching_on_validation_80_20_chronological_split"
-}
